@@ -76,20 +76,18 @@ DATA SOURCES
 POVERTY JOIN LOGIC:
 -------------------
   Source A (poverty_raw.xlsx, tab1a):
-    The 16 NCR cities excluding Manila (Caloocan, Makati, Quezon City, etc.)
-    appear in this file with HUC-level poverty incidence.
-    Manila is excluded here because its sub-district data is in Source B.
+    ALL 17 NCR cities INCLUDING City of Manila.
+    Manila is taken from this source as a whole-city poverty incidence to match
+    the single CITY OF MANILA row in population_clean.
 
   Source B (poverty_municipal_raw.xlsx):
-    All ~1,612 municipalities/cities nationwide, including Manila's districts
-    (Tondo, Binondo, Sampaloc, etc.).
-    Regional/provincial header rows are excluded (no numeric PSGC ID).
+    All non-NCR municipalities/cities nationwide.
+    Manila district rows (PSGC 133901–133914: Tondo, Binondo, etc.) appear here
+    but are intentionally excluded — Manila whole-city is already in Source A.
+    Regional/provincial header rows have col 0 = NaN → automatically excluded.
 
   The two sources are stacked into a single poverty_clean.xlsx table.
   In merged_clean.xlsx, each LGU is matched by city_municipality name.
-  Duplicate names across provinces are resolved by keeping first match
-  (acceptable since poverty data is primarily used as a feature, not
-  a precise municipality-specific identifier across all 1,600+ LGUs).
 
 FACILITY JOIN KEY (NCR HUC fix):
 ---------------------------------
@@ -99,6 +97,19 @@ FACILITY JOIN KEY (NCR HUC fix):
   field, then match on (city_municipality, province_stripped).
   For NCR HUCs, province_stripped == city_municipality, so the match key
   becomes (city, city).
+
+FACILITY NAME NORMALISATION:
+-----------------------------
+  The NHFR raw file has two systematic naming issues fixed in clean_facilities():
+  1. Ñ → '?'  The DOH export encodes Ñ as a literal '?' due to a charset bug.
+     A hard-coded map (_ENYE_FIX_MAP) restores all known affected names
+     (e.g. 'CITY OF LAS PI?AS' → 'CITY OF LAS PIÑAS').
+  2. (CAPITAL) suffix  Many LGU names in the NHFR carry a trailing "(CAPITAL)"
+     (e.g. 'CITY OF TACLOBAN (CAPITAL)').  Population_raw — the canonical LGU
+     name source — does not include this suffix, so it is stripped from both
+     city_municipality and province in facilities_clean.
+  birth_raw also carries (CAPITAL) suffixes; the same strip_capital_tag()
+  helper is applied in clean_births().
 
 OUTPUTS (written to data/clean/)
 ---------------------------------
@@ -189,7 +200,9 @@ KNOWN_PROVINCES = {
 }
 
 # ── NCR HUC cities that have city-level poverty data in poverty_raw.xlsx ──
-# Manila is excluded — its district-level data comes from poverty_municipal_raw.
+# These 16 cities get poverty data from poverty_raw (tab1a).
+# City of Manila is handled separately in clean_poverty(): it is ALSO taken
+# from poverty_raw as a whole-city entry (NOT broken into districts).
 NCR_HUC_CITIES = {
     "CITY OF MANDALUYONG", "CITY OF MARIKINA", "CITY OF PASIG",
     "QUEZON CITY", "CITY OF SAN JUAN", "CITY OF CALOOCAN",
@@ -295,6 +308,52 @@ def strip_huc_tag(s: str) -> str:
     return re.sub(r"\s*\(HUC\)\s*", "", str(s)).strip()
 
 
+# Mapping of corrupted '?' placeholders → correct Ñ characters.
+# The NHFR (facilities_raw) encodes Ñ as '?' due to a charset issue.
+# Population_raw contains the authoritative UTF-8 names; those are canonical.
+_ENYE_FIX_MAP: dict[str, str] = {
+    "CITY OF BI?AN":             "CITY OF BIÑAN",
+    "CITY OF DASMARI?AS":        "CITY OF DASMARIÑAS",
+    "CITY OF LAS PI?AS":         "CITY OF LAS PIÑAS",
+    "CITY OF PARA?AQUE":         "CITY OF PARAÑAQUE",
+    "DO?A REMEDIOS TRINIDAD":    "DOÑA REMEDIOS TRINIDAD",
+    "DUE?AS":                    "DUEÑAS",
+    "LOS BA?OS":                 "LOS BAÑOS",
+    "PE?ABLANCA":                "PEÑABLANCA",
+    "PE?ARANDA":                 "PEÑARANDA",
+    "PE?ARRUBIA":                "PEÑARRUBIA",
+    "PI?AN":                     "PIÑAN",
+    "SAG?AY":                    "SAGÑAY",
+    "SANTO NI?O":                "SANTO NIÑO",
+    "SCIENCE CITY OF MU?OZ":     "SCIENCE CITY OF MUÑOZ",
+    "SERGIO OSME?A SR.":         "SERGIO OSMEÑA SR.",
+    "SOFRONIO ESPA?OLA":         "SOFRONIO ESPAÑOLA",
+}
+
+
+def fix_enye(s: str) -> str:
+    """Replace '?' corruption with the correct Ñ character using the known map.
+    Applied to facilities names after normalize_text (which upper-cases everything).
+    """
+    return _ENYE_FIX_MAP.get(s, s)
+
+
+def strip_capital_tag(s: str) -> str:
+    """Remove trailing '(CAPITAL)' or '(CAPITAL CITY)' suffixes that appear in
+    facilities_raw and birth_raw but are absent in population_raw (our canonical
+    LGU name source).  Also removes '(FAIRE)' and similar parenthesised tokens
+    that are purely administrative labels, not part of the place name itself.
+
+    Examples:
+      'CITY OF TACLOBAN (CAPITAL)'  → 'CITY OF TACLOBAN'
+      'ISULAN (CAPITAL)'            → 'ISULAN'
+      'CITY OF PALAYAN (CAPITAL)'   → 'CITY OF PALAYAN'
+      'TUGUEGARAO CITY (CAPITAL)'   → 'TUGUEGARAO CITY'
+    Note: '(HUC)' is handled separately by strip_huc_tag; this function leaves it.
+    """
+    return re.sub(r"\s*\((CAPITAL(?: CITY)?|FAIRE)\)\s*$", "", str(s), flags=re.IGNORECASE).strip()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # STEP 1 — Clean NHFR facilities
 # ═══════════════════════════════════════════════════════════════════════════
@@ -324,6 +383,36 @@ def clean_facilities() -> pd.DataFrame:
 
     for col in ["city_municipality", "province", "region"]:
         df[col] = df[col].apply(lambda x: normalize_text(x) if pd.notna(x) else x)
+
+    # Fix charset corruption: NHFR stores Ñ as '?' → restore correct character.
+    # Then strip '(CAPITAL)' suffixes so names match population_clean (canonical).
+    df["city_municipality"] = (
+        df["city_municipality"]
+        .apply(lambda x: fix_enye(x) if pd.notna(x) else x)
+        .apply(lambda x: strip_capital_tag(x) if pd.notna(x) else x)
+    )
+    # province col can also carry (CAPITAL) tokens in some NHFR rows
+    df["province"] = df["province"].apply(
+        lambda x: strip_capital_tag(x) if pd.notna(x) else x
+    )
+
+    # ── Manila district → CITY OF MANILA rollup ───────────────────────────
+    # In the NHFR, Manila facilities are stored at district level
+    # (city_municipality = 'TONDO I/II', 'PACO', 'SAMPALOC', etc.) with
+    # province = 'CITY OF MANILA (HUC)'.  Population_clean has a single
+    # CITY OF MANILA row with no province (NCR).  We remap all district rows
+    # to city_municipality = 'CITY OF MANILA' so they aggregate correctly.
+    # This must happen BEFORE deduplication so the dedup key is consistent.
+    MANILA_DISTRICTS = {
+        "TONDO", "TONDO I/II", "BINONDO", "QUIAPO", "SAN NICOLAS",
+        "SANTA CRUZ", "SAMPALOC", "SAN MIGUEL", "ERMITA", "INTRAMUROS",
+        "MALATE", "PACO", "PANDACAN", "PORT AREA", "SANTA ANA",
+    }
+    manila_province_mask = df["province"].astype(str).str.contains("CITY OF MANILA", na=False)
+    district_mask = df["city_municipality"].isin(MANILA_DISTRICTS)
+    remap_mask = manila_province_mask & district_mask
+    df.loc[remap_mask, "city_municipality"] = "CITY OF MANILA"
+    print(f"  Manila district facilities remapped to CITY OF MANILA: {remap_mask.sum()}")
 
     df["bed_capacity"] = clean_bed_capacity(df["bed_capacity"])
 
@@ -440,16 +529,26 @@ def clean_poverty() -> pd.DataFrame:
     Combines two PSA poverty sources into one clean table.
 
     SOURCE A — poverty_raw.xlsx (tab1a):
-      Used ONLY for the 16 NCR HUC cities (all except Manila).
-      Columns extracted: city_municipality, poverty_incidence_2018/2021/2023_pct.
-      Poverty thresholds are dropped. Regional/provincial rows are excluded.
-      Manila is excluded because its sub-district data is in SOURCE B.
+      Used for ALL 17 NCR HUC cities, INCLUDING City of Manila as a whole.
+      Manila is treated as a single LGU here because population_clean has one
+      row for CITY OF MANILA (not broken down by district).  The Manila row in
+      poverty_raw gives city-wide poverty incidence, which is the correct level
+      of aggregation to match population_clean.
+      Manila districts (Tondo, Binondo, etc.) exist in SOURCE B but are excluded
+      from poverty_clean because they are not rows in population_clean.
 
     SOURCE B — poverty_municipal_raw.xlsx:
-      Used for all other LGUs including Manila's districts.
+      Used for all non-NCR LGUs (municipalities and provincial cities nationwide).
       Detection: only rows with a numeric PSGC ID (col 0) are data rows.
       Regional/provincial header rows have col 0 = NaN → automatically excluded.
       Col mapping: 2=municipality name, 3=inc_2018, 4=inc_2021, 5=inc_2023.
+      Manila district rows (PSGC 133901–133914) are present in this file but are
+      intentionally skipped because Manila is already covered as a whole in SOURCE A.
+
+    NAMING CONSISTENCY:
+      poverty_municipal_raw uses Title Case names; normalize_text() converts them
+      to ALL CAPS to match population_clean.  No (CAPITAL) suffixes appear in
+      this file so no stripping is needed here.
 
     Final columns: city_municipality, poverty_incidence_2018_pct,
                    poverty_incidence_2021_pct, poverty_incidence_2023_pct,
@@ -457,9 +556,20 @@ def clean_poverty() -> pd.DataFrame:
     """
     print("\n[3/5] Cleaning poverty data...")
 
-    # ── SOURCE A: NCR HUC cities ──────────────────────────────────────────
-    print("  Parsing NCR HUC cities from poverty_raw.xlsx (tab1a)...")
-    raw_a  = pd.read_excel(os.path.join(RAW_DIR, POVERTY_FILE), sheet_name="tab1a", header=None)
+    # ── MANILA DISTRICT PSGCs to skip in SOURCE B ─────────────────────────
+    # These correspond to the 14 sub-city districts of Manila.
+    # Manila as a whole is taken from SOURCE A instead.
+    MANILA_DISTRICT_PSGCS = {
+        133901, 133902, 133903, 133904, 133905, 133906, 133907,
+        133908, 133909, 133910, 133911, 133912, 133913, 133914,
+    }
+
+    # NCR HUC cities including Manila — all 17 LGUs in NCR
+    NCR_ALL_CITIES = NCR_HUC_CITIES | {"CITY OF MANILA"}
+
+    # ── SOURCE A: All NCR HUC cities INCLUDING City of Manila ────────────
+    print("  Parsing ALL NCR cities (incl. City of Manila) from poverty_raw.xlsx (tab1a)...")
+    raw_a = pd.read_excel(os.path.join(RAW_DIR, POVERTY_FILE), sheet_name="tab1a", header=None)
 
     ncr_records = []
     in_ncr = False
@@ -476,12 +586,13 @@ def clean_poverty() -> pd.DataFrame:
             break
         if not in_ncr:
             continue
+        # Skip district-level rows like "1st District", "2nd District" etc.
         if re.match(r"^\d+(st|nd|rd|th)\s+District", name_str, re.IGNORECASE):
             continue
 
         name_norm = normalize_text(name_str)
 
-        if name_norm not in NCR_HUC_CITIES:
+        if name_norm not in NCR_ALL_CITIES:
             continue
 
         inc_2018 = safe_float(row.get(4))
@@ -497,16 +608,24 @@ def clean_poverty() -> pd.DataFrame:
         })
 
     df_a = pd.DataFrame(ncr_records)
-    print(f"    NCR HUC rows extracted: {len(df_a)}")
+    print(f"    NCR HUC rows extracted (incl. Manila): {len(df_a)}")
 
-    # ── SOURCE B: Municipal-level data ────────────────────────────────────
-    print("  Parsing municipal data from poverty_municipal_raw.xlsx...")
+    # ── SOURCE B: Municipal-level data (non-NCR LGUs only) ───────────────
+    # Manila districts are in this file but are EXCLUDED (PSGC filter) because
+    # we use City of Manila as a whole from SOURCE A.
+    print("  Parsing municipal data from poverty_municipal_raw.xlsx (non-NCR only)...")
     raw_b = pd.read_excel(os.path.join(RAW_DIR, POVERTY_MUN_FILE), header=None)
 
     mun_records = []
     for _, row in raw_b.iterrows():
-        psgc = row.get(0)
-        if pd.isna(psgc) or not str(psgc).strip().isdigit():
+        psgc_raw = row.get(0)
+        if pd.isna(psgc_raw) or not str(psgc_raw).strip().isdigit():
+            continue
+
+        psgc = int(str(psgc_raw).strip())
+
+        # Skip Manila district rows — Manila whole-city is already in SOURCE A
+        if psgc in MANILA_DISTRICT_PSGCS:
             continue
 
         name_raw = row.get(2)
@@ -527,23 +646,14 @@ def clean_poverty() -> pd.DataFrame:
         })
 
     df_b = pd.DataFrame(mun_records)
-    print(f"    Municipal rows extracted: {len(df_b)}")
+    print(f"    Municipal rows extracted (Manila districts excluded): {len(df_b)}")
 
-    # ── Combine ───────────────────────────────────────────────────────────
+    # ── Combine: SOURCE A (NCR incl. Manila) + SOURCE B (rest of PHL) ────
     df = pd.concat([df_a, df_b], ignore_index=True)
     print(f"  Combined total: {len(df)} poverty entries")
 
-    print("\n  NCR HUC entries from SOURCE A:")
+    print("\n  NCR entries from SOURCE A (should include CITY OF MANILA):")
     print(df[df["poverty_source"] == "ncr_huc"][
-        ["city_municipality", "poverty_incidence_2018_pct",
-         "poverty_incidence_2021_pct", "poverty_incidence_2023_pct"]
-    ].to_string(index=False))
-
-    print("\n  Manila district sample (SOURCE B):")
-    manila_districts = ["TONDO", "BINONDO", "QUIAPO", "SAN NICOLAS", "SANTA CRUZ",
-                        "SAMPALOC", "SAN MIGUEL", "ERMITA", "INTRAMUROS", "MALATE",
-                        "PACO", "PANDACAN", "PORT AREA", "SANTA ANA"]
-    print(df_b[df_b["city_municipality"].isin(manila_districts)][
         ["city_municipality", "poverty_incidence_2018_pct",
          "poverty_incidence_2021_pct", "poverty_incidence_2023_pct"]
     ].to_string(index=False))
@@ -595,11 +705,13 @@ def clean_births() -> pd.DataFrame:
     df = raw[lgu_mask].copy().reset_index(drop=True)
     print(f"  LGU rows (\\x85... prefix): {len(df)}")
 
-    # Strip the \x85... prefix and normalise
+    # Strip the \x85... prefix, normalise, then strip (CAPITAL) suffix so names
+    # match population_clean (e.g. 'BANGUED (CAPITAL)' → 'BANGUED').
     df[0] = (df[0].astype(str)
              .str.replace(r"^\x85\.\.\.", "", regex=True)
              .str.strip()
-             .apply(normalize_text))
+             .apply(normalize_text)
+             .apply(strip_capital_tag))
 
     df = df.rename(columns={
         0: "city_municipality",
