@@ -16,7 +16,7 @@ TARGET VARIABLES
   hospital_count_level2  — Number of DOH Level 2 hospitals in the LGU
   hospital_count_level3  — Number of DOH Level 3 hospitals in the LGU
 
-  HOW THESE ARE COMPUTED (important for model transparency):
+  HOW THESE ARE COMPUTED:
   ----------------------------------------------------------
   Source:  DOH National Health Facilities Registry (NHFR), facilities_raw.xlsx
   Step 1.  All 44,313 raw NHFR records are deduplicated on
